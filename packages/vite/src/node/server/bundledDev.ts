@@ -58,6 +58,10 @@ export class MemoryFiles {
     this.files.set(file, content)
   }
 
+  delete(file: string): void {
+    this.files.delete(file)
+  }
+
   has(file: string): boolean {
     return this.files.has(file)
   }
@@ -114,8 +118,21 @@ export class BundledDev {
     return this._devEngine
   }
 
-  private pendingPayloadFilenames = new Set<string>()
-
+  /**
+   * Payloads (HMR patches and lazy chunks) that were sent to clients but not
+   * yet reported as delivered, mapped to the file name their source map was
+   * stored under in `memoryFiles` (if any). Both are dropped once the client
+   * reports delivery, so delivered payloads stop accumulating in memory.
+   * See https://github.com/vitejs/vite/issues/23781
+   */
+  private pendingPayloadFilenames = new Map<string, string | undefined>()
+  /**
+   * File names stored by the most recent full build output (`onOutput`).
+   * Rebuilds report the complete output, so names that disappear between
+   * builds (e.g. chunks whose content hash changed) are stale and get evicted.
+   * See https://github.com/vitejs/vite/issues/23781
+   */
+  private buildOutputFilenames = new Set<string>()
   get hasBuildOutput(): boolean {
     return this.memoryFiles.size > this.staticFiles.size
   }
@@ -253,7 +270,10 @@ export class BundledDev {
         }
       },
       onAdditionalAssets: (result) => {
-        this.storeOutputFiles(result.output)
+        // Assets emitted while generating an HMR patch or compiling a lazy
+        // entry. These never go through `onOutput`, so they are stored without
+        // evicting the last full build output.
+        this.storeOutputFiles(result.output, false)
       },
       watch: {
         skipWrite: true,
@@ -348,7 +368,12 @@ export class BundledDev {
       `TRIGGER-LAZY: trigger lazy bundling for module ${moduleId} for client ${clientId}`,
     )
     const result = await this.devEngine.compileEntry(moduleId, clientId)
-    this.pendingPayloadFilenames.add(result.filename)
+    this.pendingPayloadFilenames.set(
+      result.filename,
+      result.sourcemapFilename
+        ? `@vite/${result.sourcemapFilename}`
+        : undefined,
+    )
     // Serve the chunk's sourcemap, the same way an eager chunk's and an HMR
     // patch's maps are served. The chunk's relative `sourceMappingURL` resolves
     // against the URL it is imported from, `/@vite/lazy?...`, so register the map
@@ -373,14 +398,26 @@ export class BundledDev {
    * Note: the payload filename is unique across all clients.
    */
   markPayloadDelivered(filename: string): void {
-    if (this.pendingPayloadFilenames.delete(filename)) {
-      this.devEngine.notifyPayloadDelivered(filename)
+    if (!this.pendingPayloadFilenames.has(filename)) {
+      return
     }
+    const sourcemapFilename = this.pendingPayloadFilenames.get(filename)
+    this.pendingPayloadFilenames.delete(filename)
+    // The client evaluated the payload, so it will never request it again.
+    // Drop it (and its source map) instead of keeping every delivered payload
+    // in memory for the rest of the session.
+    this.memoryFiles.delete(filename)
+    if (sourcemapFilename) {
+      this.memoryFiles.delete(sourcemapFilename)
+    }
+    this.devEngine.notifyPayloadDelivered(filename)
   }
 
   async close(): Promise<void> {
     this._closed = true
     this.memoryFiles.clear()
+    this.buildOutputFilenames.clear()
+    this.pendingPayloadFilenames.clear()
     await this._devEngine?.close()
     this.initialBuildCompleted = false
   }
@@ -408,10 +445,16 @@ export class BundledDev {
     }
   }
 
-  private storeOutputFiles(output: RolldownOutput['output'][number][]): void {
+  private storeOutputFiles(
+    output: RolldownOutput['output'][number][],
+    isFullOutput = true,
+  ): void {
     // NOTE: don't clear memoryFiles here as incremental build reuses the files
+    const outputFilenames = new Set<string>()
     for (const outputFile of output) {
-      this.memoryFiles.set(normalizePath(outputFile.fileName), () => {
+      const fileName = normalizePath(outputFile.fileName)
+      outputFilenames.add(fileName)
+      this.memoryFiles.set(fileName, () => {
         const source =
           outputFile.type === 'chunk' ? outputFile.code : outputFile.source
         return {
@@ -419,6 +462,17 @@ export class BundledDev {
           etag: getEtag(Buffer.from(source), { weak: true }),
         }
       })
+    }
+    if (isFullOutput) {
+      // Each rebuild reports the complete output, so files from the previous
+      // build that are no longer emitted (e.g. chunks whose content hash
+      // changed) are stale: drop them instead of serving every copy ever built.
+      for (const fileName of this.buildOutputFilenames) {
+        if (!outputFilenames.has(fileName)) {
+          this.memoryFiles.delete(fileName)
+        }
+      }
+      this.buildOutputFilenames = outputFilenames
     }
   }
 
@@ -494,7 +548,10 @@ export class BundledDev {
       code: typeof hmrOutput.code === 'string' ? '[code]' : hmrOutput.code,
     })
 
-    this.pendingPayloadFilenames.add(hmrOutput.filename)
+    this.pendingPayloadFilenames.set(
+      hmrOutput.filename,
+      hmrOutput.sourcemapFilename,
+    )
     this.memoryFiles.set(hmrOutput.filename, {
       // ensure that the generated hmr patch contains ESM syntax
       // this is to avoid attacks like GHSA-4v9v-hfq4-rm2v
